@@ -103,8 +103,10 @@ class EfficientTAMBase(torch.nn.Module):
     ):
         super().__init__()
 
-        select_algorithm.PRINT_AUTOTUNE = False
-        inductor_config.max_autotune_report_choices_stats = False
+        # select_algorithm.PRINT_AUTOTUNE = False
+        # inductor_config.max_autotune_report_choices_stats = False
+
+        torch._dynamo.config.recompile_limit = 16
 
         # Part 1: the image backbone
         self.image_encoder = image_encoder

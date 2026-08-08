@@ -7,6 +7,14 @@
 import logging
 import os
 
+# RTX 50-series / TorchInductor: prune max-autotune candidates that exceed
+# the device shared-memory limit before benchmarking them. setdefault keeps
+# an explicit shell override possible. This must be set before importing torch.
+os.environ.setdefault(
+    "TORCHINDUCTOR_MAX_AUTOTUNE_PRUNE_CHOICES_BASED_ON_SHARED_MEM",
+    "1",
+)
+
 import efficient_track_anything
 
 import torch
@@ -66,13 +74,13 @@ def build_efficienttam(
     ckpt_path=None,
     device="cuda",
     mode="eval",
-    hydra_overrides_extra=[],
+    hydra_overrides_extra=None,
     apply_postprocessing=True,
     **kwargs,
 ):
+    hydra_overrides_extra = list(hydra_overrides_extra or [])
 
     if apply_postprocessing:
-        hydra_overrides_extra = hydra_overrides_extra.copy()
         hydra_overrides_extra += [
             # dynamically fall back to multi-mask if the single mask is not stable
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=true",
@@ -95,27 +103,45 @@ def build_efficienttam_video_predictor(
     ckpt_path=None,
     device="cuda",
     mode="eval",
-    hydra_overrides_extra=[],
+    hydra_overrides_extra=None,
     apply_postprocessing=True,
     vos_optimized=False,
+    execution_mode="sequential",
+    fixed_num_views=2,
+    max_objects_per_view=4,
     **kwargs,
 ):
+    hydra_overrides_extra = list(hydra_overrides_extra or [])
+
+    execution_mode = str(execution_mode).strip().lower()
+    valid_execution_modes = {"sequential", "fixed_batch"}
+    if execution_mode not in valid_execution_modes:
+        raise ValueError(
+            f"Unsupported execution_mode={execution_mode!r}. "
+            f"Expected one of {sorted(valid_execution_modes)}."
+        )
+
     if not torch.cuda.is_available() or torch.cuda.get_device_properties(0).major < 8:
         print("Disable torch compile due to unsupported GPU.")
-        hydra_overrides_extra = ["++model.compile_image_encoder=False"]
+        hydra_overrides_extra.append("++model.compile_image_encoder=False")
         vos_optimized = False
 
     hydra_overrides = [
         "++model._target_=efficient_track_anything.efficienttam_video_predictor.EfficientTAMVideoPredictor",
+        f"++model.execution_mode={execution_mode}",
+        f"++model.fixed_num_views={int(fixed_num_views)}",
+        f"++model.max_objects_per_view={int(max_objects_per_view)}",
     ]
     if vos_optimized:
         hydra_overrides = [
             "++model._target_=efficient_track_anything.efficienttam_video_predictor.EfficientTAMVideoPredictorVOS",
             "++model.compile_image_encoder=True",  # Let efficienttam_base handle this
+            f"++model.execution_mode={execution_mode}",
+            f"++model.fixed_num_views={int(fixed_num_views)}",
+            f"++model.max_objects_per_view={int(max_objects_per_view)}",
         ]
 
     if apply_postprocessing:
-        hydra_overrides_extra = hydra_overrides_extra.copy()
         hydra_overrides_extra += [
             # dynamically fall back to multi-mask if the single mask is not stable
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=true",
@@ -170,4 +196,4 @@ def _load_checkpoint(model, ckpt_path):
         if unexpected_keys:
             logging.error(unexpected_keys)
             raise RuntimeError()
-        logging.info("Loaded checkpoint sucessfully")
+        logging.info("Loaded checkpoint successfully")

@@ -23,6 +23,14 @@ from efficient_track_anything.utils.misc import (
 from tqdm import tqdm
 
 
+EXECUTION_MODE_SEQUENTIAL = "sequential"
+EXECUTION_MODE_FIXED_BATCH = "fixed_batch"
+VALID_EXECUTION_MODES = {
+    EXECUTION_MODE_SEQUENTIAL,
+    EXECUTION_MODE_FIXED_BATCH,
+}
+
+
 class EfficientTAMVideoPredictor(EfficientTAMBase):
     """The predictor class to handle user interactions and manage inference states."""
 
@@ -37,6 +45,16 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
         # if `add_all_frames_to_correct_as_cond` is True, we also append to the conditioning frame list any frame that receives a later correction click
         # if `add_all_frames_to_correct_as_cond` is False, we conditioning frame list to only use those initial conditioning frames
         add_all_frames_to_correct_as_cond=False,
+        # Multi-view execution strategy. Choose once when building the predictor.
+        # "sequential": per-view image encoding + per-object B=1 propagation.
+        # "fixed_batch": all views are encoded together and all fixed object slots
+        # are propagated in one stable batch.
+        execution_mode=EXECUTION_MODE_SEQUENTIAL,
+        # Fixed-shape multi-view propagation hyperparameters. They are only used by
+        # execution_mode="fixed_batch" and intentionally live at model level so
+        # torch.compile sees one stable tracking batch size.
+        fixed_num_views=2,
+        max_objects_per_view=4,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -44,6 +62,20 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
         self.non_overlap_masks = non_overlap_masks
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
         self.add_all_frames_to_correct_as_cond = add_all_frames_to_correct_as_cond
+
+        self.execution_mode = str(execution_mode).strip().lower()
+        if self.execution_mode not in VALID_EXECUTION_MODES:
+            raise ValueError(
+                f"Unsupported execution_mode={self.execution_mode!r}. "
+                f"Expected one of {sorted(VALID_EXECUTION_MODES)}."
+            )
+
+        self.fixed_num_views = int(fixed_num_views)
+        self.max_objects_per_view = int(max_objects_per_view)
+        if self.fixed_num_views <= 0:
+            raise ValueError("fixed_num_views must be > 0")
+        if self.max_objects_per_view <= 0:
+            raise ValueError("max_objects_per_view must be > 0")
 
     @torch.inference_mode()
     def init_state(
@@ -638,6 +670,664 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
             )
             yield frame_idx, obj_ids, video_res_masks
 
+
+    # ---------------------------------------------------------------------
+    # Unified multi-view execution API
+    # ---------------------------------------------------------------------
+
+    @property
+    def fixed_tracking_batch_size(self):
+        """Return the compiled object batch size used by fixed-batch mode."""
+        return self.fixed_num_views * self.max_objects_per_view
+
+    def execution_summary(self):
+        """Return a small integration-friendly description of the execution mode."""
+        summary = {
+            "execution_mode": self.execution_mode,
+            "fixed_num_views": self.fixed_num_views,
+            "max_objects_per_view": self.max_objects_per_view,
+        }
+        if self.execution_mode == EXECUTION_MODE_FIXED_BATCH:
+            summary["tracking_batch_size"] = self.fixed_tracking_batch_size
+        return summary
+
+    @staticmethod
+    def _mark_cudagraph_step_begin():
+        """Mark one logical inference step when PyTorch CUDAGraphs are active."""
+        compiler = getattr(torch, "compiler", None)
+        marker = getattr(compiler, "cudagraph_mark_step_begin", None)
+        if marker is not None:
+            marker()
+
+    @torch.inference_mode()
+    def prepare_multiview_states(
+        self,
+        inference_states,
+        conditioning_frame_idx=0,
+    ):
+        """
+        Prepare a list of view states for the selected execution strategy.
+
+        Call this once after seeding the real objects on the conditioning frame.
+        The same integration code can then call ``propagate_multiview_step`` for
+        either execution mode.
+        """
+        if not inference_states:
+            raise ValueError("inference_states must contain at least one view")
+
+        if self.execution_mode == EXECUTION_MODE_FIXED_BATCH:
+            self.prepare_fixed_multiview_states(
+                inference_states,
+                conditioning_frame_idx=conditioning_frame_idx,
+            )
+        else:
+            for state in inference_states:
+                self.propagate_in_video_preflight(state)
+                state["multiview_prepared"] = True
+                state["multiview_execution_mode"] = self.execution_mode
+
+        return inference_states
+
+    @torch.inference_mode()
+    def propagate_sequential_multiview_step(
+        self,
+        inference_states,
+        frame_idx,
+        reverse=False,
+    ):
+        """
+        Original multi-view execution path: per-view encoder + per-object B=1.
+
+        With two views and three objects per view this corresponds to the old
+        ``2E + 6B`` structure. Image features are cached inside each view state,
+        so the first object of a view runs the encoder and the remaining objects
+        reuse that view's cached features.
+        """
+        results = []
+
+        for view_idx, state in enumerate(inference_states):
+            if not state.get("multiview_prepared", False):
+                raise RuntimeError(
+                    "Call prepare_multiview_states(...) once after seeding "
+                    "objects and before multi-view propagation."
+                )
+
+            obj_ids = list(state["obj_ids"])
+            num_objects = self._get_obj_num(state)
+            pred_masks_per_obj = []
+
+            for obj_idx in range(num_objects):
+                obj_output_dict = state["output_dict_per_obj"][obj_idx]
+
+                if frame_idx in obj_output_dict["cond_frame_outputs"]:
+                    current_out = obj_output_dict["cond_frame_outputs"][frame_idx]
+                    pred_masks = current_out["pred_masks"].to(
+                        state["device"], non_blocking=True
+                    )
+                    if self.clear_non_cond_mem_around_input:
+                        self._clear_obj_non_cond_mem_around_input(
+                            state, frame_idx, obj_idx
+                        )
+                else:
+                    # Each B=1 object propagation is one logical compiled/CUDAGraph
+                    # invocation. Explicitly mark the boundary to avoid graph-managed
+                    # outputs being reused across object calls.
+                    self._mark_cudagraph_step_begin()
+                    current_out, pred_masks = self._run_single_frame_inference(
+                        inference_state=state,
+                        output_dict=obj_output_dict,
+                        frame_idx=frame_idx,
+                        batch_size=1,
+                        is_init_cond_frame=False,
+                        point_inputs=None,
+                        mask_inputs=None,
+                        reverse=reverse,
+                        run_mem_encoder=True,
+                    )
+                    obj_output_dict["non_cond_frame_outputs"][frame_idx] = current_out
+
+                state["frames_tracked_per_obj"][obj_idx][frame_idx] = {
+                    "reverse": reverse
+                }
+                pred_masks_per_obj.append(pred_masks)
+
+            if pred_masks_per_obj:
+                all_pred_masks = (
+                    torch.cat(pred_masks_per_obj, dim=0)
+                    if len(pred_masks_per_obj) > 1
+                    else pred_masks_per_obj[0]
+                )
+                _, video_res_masks = self._get_orig_video_res_output(
+                    state, all_pred_masks
+                )
+            else:
+                video_res_masks = torch.empty(
+                    (0, 1, state["video_height"], state["video_width"]),
+                    device=state["device"],
+                )
+
+            results.append(
+                {
+                    "view_idx": view_idx,
+                    "frame_idx": frame_idx,
+                    "obj_ids": obj_ids,
+                    "video_res_masks": video_res_masks,
+                    "num_real_objects": num_objects,
+                    "num_dummy_objects": 0,
+                    "execution_mode": EXECUTION_MODE_SEQUENTIAL,
+                }
+            )
+
+        return results
+
+    @torch.inference_mode()
+    def propagate_multiview_step(
+        self,
+        inference_states,
+        frame_idx,
+        reverse=False,
+    ):
+        """Propagate one synchronized multi-view frame using the configured mode."""
+        if self.execution_mode == EXECUTION_MODE_FIXED_BATCH:
+            return self.propagate_fixed_multiview_step(
+                inference_states=inference_states,
+                frame_idx=frame_idx,
+                reverse=reverse,
+            )
+        return self.propagate_sequential_multiview_step(
+            inference_states=inference_states,
+            frame_idx=frame_idx,
+            reverse=reverse,
+        )
+
+    @torch.inference_mode()
+    def propagate_multiview(
+        self,
+        inference_states,
+        start_frame_idx,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
+        """Generator wrapper around :meth:`propagate_multiview_step`."""
+        if not inference_states:
+            return
+
+        if max_frame_num_to_track is None:
+            max_frame_num_to_track = min(
+                state["num_frames"] for state in inference_states
+            )
+
+        if reverse:
+            end = max(start_frame_idx - max_frame_num_to_track + 1, 0)
+            processing_order = range(start_frame_idx, end - 1, -1)
+        else:
+            last_frame = min(
+                min(state["num_frames"] for state in inference_states) - 1,
+                start_frame_idx + max_frame_num_to_track - 1,
+            )
+            processing_order = range(start_frame_idx, last_frame + 1)
+
+        for frame_idx in processing_order:
+            yield frame_idx, self.propagate_multiview_step(
+                inference_states=inference_states,
+                frame_idx=frame_idx,
+                reverse=reverse,
+            )
+
+
+    # ---------------------------------------------------------------------
+    # Fixed-shape all-view / all-object propagation
+    # ---------------------------------------------------------------------
+
+    def _fixed_batch_slot_order(self, inference_states):
+        """Return view-major (view_idx, obj_idx) slot order."""
+        if len(inference_states) != self.fixed_num_views:
+            raise ValueError(
+                f"Expected exactly {self.fixed_num_views} views, got "
+                f"{len(inference_states)}. The number of views is part of the "
+                "compiled batch shape."
+            )
+        slots = []
+        for view_idx, state in enumerate(inference_states):
+            n = self._get_obj_num(state)
+            if n != self.max_objects_per_view:
+                raise RuntimeError(
+                    f"View {view_idx} has {n} object slots, expected exactly "
+                    f"{self.max_objects_per_view}. Call "
+                    "pad_state_to_fixed_object_slots(...) before propagation."
+                )
+            for obj_idx in range(self.max_objects_per_view):
+                slots.append((view_idx, obj_idx))
+        return slots
+
+    @torch.inference_mode()
+    def pad_state_to_fixed_object_slots(
+        self,
+        inference_state,
+        frame_idx=0,
+        view_idx=0,
+        dummy_prefix="__efficienttam_dummy__",
+    ):
+        """
+        Pad one view to ``max_objects_per_view`` using real empty-mask objects.
+
+        Dummy slots are created once, on the same conditioning frame as the real
+        objects. They subsequently propagate like normal objects, but callers omit
+        them from returned results. This keeps every slot's temporal history and
+        tensor shape aligned, which is what makes a single fixed B graph possible.
+        """
+        current_n = self._get_obj_num(inference_state)
+        if current_n > self.max_objects_per_view:
+            raise RuntimeError(
+                f"View {view_idx} already has {current_n} objects but "
+                f"max_objects_per_view={self.max_objects_per_view}."
+            )
+
+        if "fixed_batch_real_obj_ids" not in inference_state:
+            inference_state["fixed_batch_real_obj_ids"] = list(
+                inference_state["obj_ids"]
+            )
+            inference_state["fixed_batch_real_obj_count"] = current_n
+            inference_state["fixed_batch_dummy_obj_ids"] = []
+        else:
+            # Padding is idempotent. Do not reinterpret already-created dummy slots
+            # as real detections on a later call.
+            current_n = self._get_obj_num(inference_state)
+
+        if current_n == self.max_objects_per_view:
+            return list(inference_state.get("fixed_batch_dummy_obj_ids", []))
+
+        # For exact batched/sequential equivalence, all real objects should have
+        # been initialized on this same conditioning frame. This is the natural
+        # setup when a detector refresh seeds all instances together.
+        for obj_idx in range(inference_state["fixed_batch_real_obj_count"]):
+            has_prompt = (
+                frame_idx in inference_state["mask_inputs_per_obj"][obj_idx]
+                or frame_idx in inference_state["point_inputs_per_obj"][obj_idx]
+            )
+            if not has_prompt:
+                raise RuntimeError(
+                    f"Real object slot {obj_idx} in view {view_idx} was not seeded "
+                    f"on frame {frame_idx}. Fixed batching requires all slots to "
+                    "share the same conditioning/history topology."
+                )
+
+        dummy_mask = torch.zeros(
+            inference_state["video_height"],
+            inference_state["video_width"],
+            dtype=torch.bool,
+        )
+        dummy_ids = inference_state["fixed_batch_dummy_obj_ids"]
+        while self._get_obj_num(inference_state) < self.max_objects_per_view:
+            slot_idx = self._get_obj_num(inference_state)
+            dummy_id = f"{dummy_prefix}:view={view_idx}:slot={slot_idx}"
+            suffix = 0
+            while dummy_id in inference_state["obj_id_to_idx"]:
+                suffix += 1
+                dummy_id = (
+                    f"{dummy_prefix}:view={view_idx}:slot={slot_idx}:{suffix}"
+                )
+            self.add_new_mask(
+                inference_state=inference_state,
+                frame_idx=frame_idx,
+                obj_id=dummy_id,
+                mask=dummy_mask,
+            )
+            dummy_ids.append(dummy_id)
+        return list(dummy_ids)
+
+    @torch.inference_mode()
+    def prepare_fixed_multiview_states(
+        self,
+        inference_states,
+        conditioning_frame_idx=0,
+    ):
+        """Pad all views, finalize conditioning memories, and validate alignment."""
+        if len(inference_states) != self.fixed_num_views:
+            raise ValueError(
+                f"Expected {self.fixed_num_views} inference states, got "
+                f"{len(inference_states)}"
+            )
+
+        num_frames = {state["num_frames"] for state in inference_states}
+        if len(num_frames) != 1:
+            raise RuntimeError(
+                "Fixed multi-view batching requires synchronized views with the "
+                "same num_frames."
+            )
+
+        for view_idx, state in enumerate(inference_states):
+            self.pad_state_to_fixed_object_slots(
+                state,
+                frame_idx=conditioning_frame_idx,
+                view_idx=view_idx,
+            )
+            self.propagate_in_video_preflight(state)
+            state["fixed_batch_prepared"] = True
+            state["multiview_prepared"] = True
+            state["multiview_execution_mode"] = EXECUTION_MODE_FIXED_BATCH
+
+        self._validate_fixed_batch_history_alignment(inference_states)
+        return inference_states
+
+    def _validate_fixed_batch_history_alignment(self, inference_states):
+        """
+        Require identical conditioning/non-conditioning frame keys for all slots.
+
+        The underlying EfficientTAM memory attention is batched over objects but
+        does not carry a per-batch-element memory padding mask. Keeping slot history
+        topology aligned gives exact semantics without introducing approximate
+        memory padding for newly-created objects.
+        """
+        slots = self._fixed_batch_slot_order(inference_states)
+        reference = None
+        for view_idx, obj_idx in slots:
+            out = inference_states[view_idx]["output_dict_per_obj"][obj_idx]
+            signature = (
+                tuple(sorted(out["cond_frame_outputs"].keys())),
+                tuple(sorted(out["non_cond_frame_outputs"].keys())),
+            )
+            if reference is None:
+                reference = signature
+            elif signature != reference:
+                raise RuntimeError(
+                    "Fixed all-view batching requires aligned memory history across "
+                    "all object slots. Re-seed all slots together on the same detector "
+                    "refresh frame (real masks + dummy zero masks) before using this "
+                    "fast path."
+                )
+        return reference
+
+    @staticmethod
+    def _cat_fixed_batch_frame_outputs(frame_outputs):
+        """Pack B=1 compact outputs into one B=N compact output."""
+        packed = {}
+        tensor_keys = (
+            "maskmem_features",
+            "pred_masks",
+            "obj_ptr",
+            "object_score_logits",
+        )
+        for key in tensor_keys:
+            vals = [out.get(key, None) for out in frame_outputs]
+            if all(v is None for v in vals):
+                packed[key] = None
+            elif any(v is None for v in vals):
+                raise RuntimeError(
+                    f"Cannot batch frame outputs: key '{key}' is missing for only "
+                    "some slots."
+                )
+            else:
+                packed[key] = torch.cat(vals, dim=0)
+
+        pos_vals = [out.get("maskmem_pos_enc", None) for out in frame_outputs]
+        if all(v is None for v in pos_vals):
+            packed["maskmem_pos_enc"] = None
+        elif any(v is None for v in pos_vals):
+            raise RuntimeError(
+                "Cannot batch frame outputs: maskmem_pos_enc is missing for only "
+                "some slots."
+            )
+        else:
+            num_levels = len(pos_vals[0])
+            if any(len(v) != num_levels for v in pos_vals):
+                raise RuntimeError("maskmem_pos_enc level count differs across slots")
+            packed["maskmem_pos_enc"] = [
+                torch.cat([v[level] for v in pos_vals], dim=0)
+                for level in range(num_levels)
+            ]
+        return packed
+
+    def _pack_fixed_batch_output_dict(self, inference_states):
+        """Pack all view/object histories into one output_dict with batch B=V*S."""
+        self._validate_fixed_batch_history_alignment(inference_states)
+        slots = self._fixed_batch_slot_order(inference_states)
+        packed = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+        for storage_key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            first_state, first_obj = slots[0]
+            first_dict = inference_states[first_state]["output_dict_per_obj"][
+                first_obj
+            ][storage_key]
+            for hist_frame_idx in sorted(first_dict.keys()):
+                frame_outputs = [
+                    inference_states[view_idx]["output_dict_per_obj"][obj_idx][
+                        storage_key
+                    ][hist_frame_idx]
+                    for view_idx, obj_idx in slots
+                ]
+                packed[storage_key][hist_frame_idx] = (
+                    self._cat_fixed_batch_frame_outputs(frame_outputs)
+                )
+        return packed
+
+    @torch.inference_mode()
+    def _get_fixed_multiview_features(self, inference_states, frame_idx):
+        """
+        Encode all views together, then expand each view feature to its fixed slots.
+        """
+        frame_indices = [frame_idx] * len(inference_states)
+        self.cache_image_features_batched(inference_states, frame_indices)
+
+        per_view = []
+        for state in inference_states:
+            features = self._get_image_feature(
+                state,
+                frame_idx=frame_idx,
+                batch_size=self.max_objects_per_view,
+            )
+            per_view.append(features)
+
+        feat_sizes = per_view[0][4]
+        for features in per_view[1:]:
+            if features[4] != feat_sizes:
+                raise RuntimeError("Feature sizes differ across views")
+
+        num_levels = len(per_view[0][2])
+        current_vision_feats = [
+            torch.cat([features[2][level] for features in per_view], dim=1)
+            for level in range(num_levels)
+        ]
+        current_vision_pos_embeds = [
+            torch.cat([features[3][level] for features in per_view], dim=1)
+            for level in range(num_levels)
+        ]
+        return current_vision_feats, current_vision_pos_embeds, feat_sizes
+
+    @torch.inference_mode()
+    def propagate_fixed_multiview_step(
+        self,
+        inference_states,
+        frame_idx,
+        reverse=False,
+    ):
+        """
+        Propagate every object slot in every view in one fixed-size tracking batch.
+
+        Example: fixed_num_views=2 and max_objects_per_view=4 => one B=8
+        ``track_step`` call. If a view contains only 2 or 3 real detections, its
+        remaining slots are real zero-mask dummy objects created during preparation.
+
+        Returns a list with one result dict per view. Dummy slots are omitted from
+        obj_ids and video_res_masks.
+        """
+        if self.non_overlap_masks_for_mem_enc:
+            raise RuntimeError(
+                "propagate_fixed_multiview_step requires "
+                "non_overlap_masks_for_mem_enc=False. Global B contains multiple "
+                "independent views, so cross-batch non-overlap would be incorrect."
+            )
+
+        for state in inference_states:
+            if not state.get("fixed_batch_prepared", False):
+                raise RuntimeError(
+                    "Call prepare_fixed_multiview_states(...) once after seeding "
+                    "the real object masks and before fixed-batch propagation."
+                )
+
+        self._validate_fixed_batch_history_alignment(inference_states)
+        slots = self._fixed_batch_slot_order(inference_states)
+
+        # This fast path is intended for ordinary propagation frames. Conditioning
+        # frames are handled during detector refresh / preparation.
+        for view_idx, obj_idx in slots:
+            obj_out = inference_states[view_idx]["output_dict_per_obj"][obj_idx]
+            if frame_idx in obj_out["cond_frame_outputs"]:
+                raise RuntimeError(
+                    f"Frame {frame_idx} is a conditioning frame for at least one "
+                    "slot. Fixed batch propagation should start on the next frame."
+                )
+
+        current_vision_feats, current_vision_pos_embeds, feat_sizes = (
+            self._get_fixed_multiview_features(inference_states, frame_idx)
+        )
+        packed_output_dict = self._pack_fixed_batch_output_dict(inference_states)
+        total_batch = self.fixed_tracking_batch_size
+
+        self._mark_cudagraph_step_begin()
+        current_out = self.track_step(
+            frame_idx=frame_idx,
+            is_init_cond_frame=False,
+            current_vision_feats=current_vision_feats,
+            current_vision_pos_embeds=current_vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            point_inputs=None,
+            mask_inputs=None,
+            output_dict=packed_output_dict,
+            num_frames=inference_states[0]["num_frames"],
+            track_in_reverse=reverse,
+            run_mem_encoder=True,
+            prev_sam_mask_logits=None,
+        )
+
+        if current_out["pred_masks"].shape[0] != total_batch:
+            raise RuntimeError(
+                f"Unexpected batched output size {current_out['pred_masks'].shape[0]}, "
+                f"expected {total_batch}"
+            )
+
+        pred_masks_gpu = current_out["pred_masks"]
+        if self.fill_hole_area > 0:
+            pred_masks_gpu = fill_holes_in_mask_scores(
+                pred_masks_gpu, self.fill_hole_area
+            )
+
+        results = []
+        for view_idx, state in enumerate(inference_states):
+            view_start = view_idx * self.max_objects_per_view
+            # Cache one B=1 positional-encoding copy per inference session, matching
+            # the storage format used by the original predictor.
+            raw_view_pos = None
+            if current_out["maskmem_pos_enc"] is not None:
+                raw_view_pos = [
+                    x[view_start : view_start + 1]
+                    for x in current_out["maskmem_pos_enc"]
+                ]
+                shared_view_pos = self._get_maskmem_pos_enc(
+                    state, {"maskmem_pos_enc": raw_view_pos}
+                )
+            else:
+                shared_view_pos = None
+
+            for obj_idx in range(self.max_objects_per_view):
+                batch_idx = view_start + obj_idx
+                storage_device = state["storage_device"]
+
+                maskmem_features = current_out["maskmem_features"]
+                if maskmem_features is not None:
+                    slot_mem = maskmem_features[
+                        batch_idx : batch_idx + 1
+                    ].to(torch.bfloat16)
+                    slot_mem = slot_mem.to(storage_device, non_blocking=True)
+                else:
+                    slot_mem = None
+
+                slot_pred = pred_masks_gpu[
+                    batch_idx : batch_idx + 1
+                ].to(storage_device, non_blocking=True)
+                slot_ptr = current_out["obj_ptr"][batch_idx : batch_idx + 1]
+                slot_score = current_out["object_score_logits"][
+                    batch_idx : batch_idx + 1
+                ]
+
+                compact_out = {
+                    "maskmem_features": slot_mem,
+                    "maskmem_pos_enc": shared_view_pos,
+                    "pred_masks": slot_pred,
+                    "obj_ptr": slot_ptr,
+                    "object_score_logits": slot_score,
+                }
+                state["output_dict_per_obj"][obj_idx][
+                    "non_cond_frame_outputs"
+                ][frame_idx] = compact_out
+                state["frames_tracked_per_obj"][obj_idx][frame_idx] = {
+                    "reverse": reverse
+                }
+
+            real_count = state.get(
+                "fixed_batch_real_obj_count", self.max_objects_per_view
+            )
+            real_ids = list(state.get("fixed_batch_real_obj_ids", []))
+            real_pred_masks = pred_masks_gpu[
+                view_start : view_start + real_count
+            ]
+            if real_count > 0:
+                _, video_res_masks = self._get_orig_video_res_output(
+                    state, real_pred_masks
+                )
+            else:
+                video_res_masks = torch.empty(
+                    (0, 1, state["video_height"], state["video_width"]),
+                    device=state["device"],
+                    dtype=pred_masks_gpu.dtype,
+                )
+            results.append(
+                {
+                    "view_idx": view_idx,
+                    "frame_idx": frame_idx,
+                    "obj_ids": real_ids,
+                    "video_res_masks": video_res_masks,
+                    "num_real_objects": real_count,
+                    "num_dummy_objects": self.max_objects_per_view - real_count,
+                    "execution_mode": EXECUTION_MODE_FIXED_BATCH,
+                }
+            )
+
+        return results
+
+    @torch.inference_mode()
+    def propagate_fixed_multiview(
+        self,
+        inference_states,
+        start_frame_idx,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
+        """Explicit fixed-batch generator kept for backward compatibility."""
+        if max_frame_num_to_track is None:
+            max_frame_num_to_track = min(
+                state["num_frames"] for state in inference_states
+            )
+
+        if reverse:
+            end = max(start_frame_idx - max_frame_num_to_track + 1, 0)
+            processing_order = range(start_frame_idx, end - 1, -1)
+        else:
+            last_frame = min(
+                min(state["num_frames"] for state in inference_states) - 1,
+                start_frame_idx + max_frame_num_to_track - 1,
+            )
+            processing_order = range(start_frame_idx, last_frame + 1)
+
+        for frame_idx in processing_order:
+            yield frame_idx, self.propagate_fixed_multiview_step(
+                inference_states=inference_states,
+                frame_idx=frame_idx,
+                reverse=reverse,
+            )
+
     @torch.inference_mode()
     def clear_all_prompts_in_frame(
         self, inference_state, frame_idx, obj_id, need_output=True
@@ -1125,7 +1815,18 @@ class EfficientTAMVideoPredictorVOS(EfficientTAMVideoPredictor):
 
     def _compile_all_components(self):
         print("Compiling all components for VOS setting. First time may be very slow.")
-        
+
+        # memory_attention is specialized with dynamic=False because the dynamic
+        # B>1 path currently triggers a TorchInductor fusion/codegen failure. Its
+        # temporal-memory length still grows during startup, so keep enough static
+        # specializations for the finite warmup sequence.
+        try:
+            current_limit = int(torch._dynamo.config.recompile_limit)
+            if current_limit < 16:
+                torch._dynamo.config.recompile_limit = 16
+        except (AttributeError, TypeError, ValueError):
+            pass
+
         self.memory_encoder.forward = torch.compile(
             self.memory_encoder.forward,
             mode="max-autotune",
@@ -1135,9 +1836,9 @@ class EfficientTAMVideoPredictorVOS(EfficientTAMVideoPredictor):
 
         self.memory_attention.forward = torch.compile(
             self.memory_attention.forward,
-            mode="max-autotune",
+            mode="default",
             fullgraph=True,
-            dynamic=True,  # Num. of memories varies
+            dynamic=False,  # Num. of memories varies
         )
 
         self.sam_prompt_encoder.forward = torch.compile(

@@ -87,6 +87,19 @@ python tests/test_multicamera_encoder_batch.py \
     --vos-optimized
 ```
 
+```bash
+python tests/test_allview_fixed_batch.py \
+    --config configs/efficienttam/efficienttam_s_512x512.yaml \
+    --checkpoint checkpoints/efficienttam_s_512x512.pt \
+    --views 2 \
+    --max-objects-per-view 3 \
+    --real-objects-per-view 3,2 \
+    --warmup-frames 20 \
+    --benchmark-frames 50 \
+    --vos-optimized
+```
+
+
 
 ### Building Efficient Track Anything
 You can build efficient track anything model with a config and initial the model with a checkpoint,
