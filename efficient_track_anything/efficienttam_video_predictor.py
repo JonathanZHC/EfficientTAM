@@ -709,6 +709,140 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
             v["non_cond_frame_outputs"].clear()
         for v in inference_state["frames_tracked_per_obj"].values():
             v.clear()
+    
+    @staticmethod
+    def _slice_batched_backbone_output(
+        backbone_out,
+        batch_idx: int,
+        batch_size: int,
+    ):
+        """Return one B=1 view from a batched backbone output."""
+
+        if not 0 <= batch_idx < batch_size:
+            raise IndexError(
+                f"batch_idx={batch_idx} outside batch_size={batch_size}"
+            )
+
+        sliced_backbone_fpn = []
+
+        for level, feat in enumerate(backbone_out["backbone_fpn"]):
+            if feat.shape[0] != batch_size:
+                raise RuntimeError(
+                    f"backbone_fpn[{level}] has batch={feat.shape[0]}, "
+                    f"expected {batch_size}; shape={tuple(feat.shape)}"
+                )
+
+            sliced_backbone_fpn.append(
+                feat[batch_idx : batch_idx + 1]
+            )
+
+        sliced_vision_pos_enc = []
+
+        for level, pos in enumerate(backbone_out["vision_pos_enc"]):
+            if pos.shape[0] == batch_size:
+                sliced_pos = pos[batch_idx : batch_idx + 1]
+
+            elif pos.shape[0] == 1:
+                # Position encoding can be shared by all images.
+                sliced_pos = pos
+
+            else:
+                raise RuntimeError(
+                    f"vision_pos_enc[{level}] has batch={pos.shape[0]}, "
+                    f"expected 1 or {batch_size}; "
+                    f"shape={tuple(pos.shape)}"
+                )
+
+            sliced_vision_pos_enc.append(sliced_pos)
+
+        return {
+            "backbone_fpn": sliced_backbone_fpn,
+            "vision_pos_enc": sliced_vision_pos_enc,
+        }
+
+    @torch.inference_mode()
+    def cache_image_features_batched(
+        self,
+        inference_states,
+        frame_indices,
+    ):
+        """
+        Batch the image encoder across independent videos/cameras.
+
+        Only image encoding is batched. Each inference_state keeps its own
+        temporal memories, object states, and tracking outputs.
+        """
+
+        if not inference_states:
+            raise ValueError("inference_states must not be empty")
+
+        if len(inference_states) != len(frame_indices):
+            raise ValueError(
+                "inference_states and frame_indices must have equal length"
+            )
+
+        batch_size = len(inference_states)
+        device = self.device
+
+        images = []
+        expected_shape = None
+
+        for state_idx, (inference_state, frame_idx) in enumerate(
+            zip(inference_states, frame_indices)
+        ):
+            image = inference_state["images"][frame_idx]
+
+            if image.ndim != 3:
+                raise RuntimeError(
+                    f"Expected image [3,H,W], got {tuple(image.shape)} "
+                    f"for state {state_idx}"
+                )
+
+            image = image.to(
+                device,
+                non_blocking=True,
+            ).float()
+
+            if expected_shape is None:
+                expected_shape = tuple(image.shape)
+            elif tuple(image.shape) != expected_shape:
+                raise RuntimeError(
+                    "All camera images must have the same model-input shape. "
+                    f"Expected {expected_shape}, "
+                    f"got {tuple(image.shape)}"
+                )
+
+            images.append(image)
+
+        # B cameras:
+        # [B, 3, H, W]
+        image_batch = torch.stack(images, dim=0)
+
+        # ONE image encoder invocation for all cameras.
+        backbone_batch = self.forward_image(image_batch)
+
+        for batch_idx, (inference_state, frame_idx) in enumerate(
+            zip(inference_states, frame_indices)
+        ):
+            backbone_single = self._slice_batched_backbone_output(
+                backbone_out=backbone_batch,
+                batch_idx=batch_idx,
+                batch_size=batch_size,
+            )
+
+            image_single = image_batch[
+                batch_idx : batch_idx + 1
+            ]
+
+            # Match the existing `_get_image_feature()` cache format exactly.
+            inference_state["cached_features"] = {
+                frame_idx: (
+                    image_single,
+                    backbone_single,
+                )
+            }
+
+        return image_batch, backbone_batch
 
     def _get_image_feature(self, inference_state, frame_idx, batch_size):
         """Compute the image features on a given frame."""
@@ -991,6 +1125,7 @@ class EfficientTAMVideoPredictorVOS(EfficientTAMVideoPredictor):
 
     def _compile_all_components(self):
         print("Compiling all components for VOS setting. First time may be very slow.")
+        
         self.memory_encoder.forward = torch.compile(
             self.memory_encoder.forward,
             mode="max-autotune",

@@ -75,6 +75,18 @@ For efficient track anything image, run
 python app_image.py
 ```
 
+### Test the updated parts
+
+```bash
+python tests/test_multicamera_encoder_batch.py \
+    --config configs/efficienttam/efficienttam_s_512x512.yaml \
+    --checkpoint checkpoints/efficienttam_s_512x512.pt \
+    --batch-size 2 \
+    --warmup 5 \
+    --runs 50 \
+    --vos-optimized
+```
+
 
 ### Building Efficient Track Anything
 You can build efficient track anything model with a config and initial the model with a checkpoint,

@@ -13,6 +13,9 @@ from efficient_track_anything.modeling.efficienttam_utils import (
     select_closest_cond_frames,
 )
 
+import torch._inductor.config as inductor_config
+import torch._inductor.select_algorithm as select_algorithm
+
 from efficient_track_anything.modeling.sam.mask_decoder import MaskDecoder
 from efficient_track_anything.modeling.sam.prompt_encoder import PromptEncoder
 from efficient_track_anything.modeling.sam.transformer import TwoWayTransformer
@@ -99,6 +102,9 @@ class EfficientTAMBase(torch.nn.Module):
         compile_image_encoder: bool = False,
     ):
         super().__init__()
+
+        select_algorithm.PRINT_AUTOTUNE = False
+        inductor_config.max_autotune_report_choices_stats = False
 
         # Part 1: the image backbone
         self.image_encoder = image_encoder
@@ -190,6 +196,7 @@ class EfficientTAMBase(torch.nn.Module):
             print(
                 "Image encoder compilation is enabled. First forward pass will be slow."
             )
+            
             self.image_encoder.forward = torch.compile(
                 self.image_encoder.forward,
                 mode="max-autotune",
