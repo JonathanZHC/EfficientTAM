@@ -116,3 +116,63 @@ The VOS-optimized path keeps the stable settings established during the B>1 work
   through `TORCHINDUCTOR_MAX_AUTOTUNE_PRUNE_CHOICES_BASED_ON_SHARED_MEM=1` in the builder.
 
 Do not include the first compile/specialization frames in realtime latency statistics.
+
+## Asynchronous corrected-reference primitive
+
+For a sparse detector running asynchronously, EfficientTAM can keep persistent
+image-feature snapshots and later correct the current tracker state directly from
+an older detector frame without replaying every intermediate frame.
+
+```python
+# Every synchronized RGB bundle can be encoded once and stored in an external
+# ring buffer. The snapshot owns cloned GPU tensors and is safe across later
+# torch.compile / CUDAGraph steps.
+snapshot_t = predictor.snapshot_multiview_image_features(
+    states,
+    frame_idx=t,
+)
+
+# Ordinary tracking can reuse the same snapshot, so the encoder is not run twice.
+results_t = predictor.propagate_multiview_step(
+    states,
+    frame_idx=t,
+    image_feature_snapshot=snapshot_t,
+)
+
+# When an asynchronous detector result for historical frame x arrives:
+results_now = predictor.correct_multiview_from_reference(
+    states,
+    reference_feature_snapshot=feature_ring[x],
+    reference_masks=masks_x,  # one N x H x W entry per view, real-object order
+    current_frame_idx=t_now,
+    current_feature_snapshot=feature_ring[t_now],
+)
+```
+
+The correction path intentionally discards stale intermediate non-conditioning
+memories. It builds a corrected conditioning memory on frame `x`, directly
+infers frame `t_now`, and replaces the live history with:
+
+```text
+cond:     x (corrected detector mask)
+non-cond: t_now (new direct prediction)
+```
+
+The following frame uses the ordinary `propagate_multiview_step()` API again.
+Both `sequential` and `fixed_batch` modes are supported. In fixed-batch mode,
+reference masks are supplied only for real objects; dummy slots are padded with
+zero masks internally and the compiled batch size remains unchanged.
+
+The feature snapshot ring-buffer policy is intentionally not implemented inside
+EfficientTAM. The application owns retention/eviction. One snapshot's storage can
+be inspected with:
+
+```python
+bytes_per_snapshot = predictor.multiview_feature_snapshot_nbytes(snapshot_t)
+```
+
+A standalone smoke/benchmark is included at:
+
+```text
+efficient_track_anything/tests/test_direct_reference_correction.py
+```

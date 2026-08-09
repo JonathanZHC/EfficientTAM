@@ -78,6 +78,10 @@ python app_image.py
 ### Test the updated parts
 
 ```bash
+conda activate efficient_track_anything
+```
+
+```bash
 python tests/test_multicamera_encoder_batch.py \
     --config configs/efficienttam/efficienttam_s_512x512.yaml \
     --checkpoint checkpoints/efficienttam_s_512x512.pt \
@@ -99,6 +103,13 @@ python tests/test_allview_fixed_batch.py \
     --vos-optimized
 ```
 
+```bash
+python tests/test_direct_reference_correction.py \
+  --checkpoint checkpoints/efficienttam_s_512x512.pt \
+  --execution-mode fixed_batch \
+  --max-objects-per-view 3 \
+  --objects 2
+```
 
 
 ### Building Efficient Track Anything
