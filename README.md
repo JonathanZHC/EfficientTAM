@@ -111,6 +111,17 @@ python tests/test_direct_reference_correction.py \
   --objects 2
 ```
 
+```bash
+python tests/benchmark_vos_compile_mode.py \
+  --checkpoint checkpoints/efficienttam_s_512x512.pt \
+  --execution-mode fixed_batch \
+  --max-objects-per-view 3 \
+  --objects 2 \
+  --warmup-frames 30 \
+  --measure-frames 100 \
+  --fresh-compile-cache
+```
+
 
 ### Building Efficient Track Anything
 You can build efficient track anything model with a config and initial the model with a checkpoint,

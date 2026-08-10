@@ -76,9 +76,13 @@ def build_efficienttam(
     mode="eval",
     hydra_overrides_extra=None,
     apply_postprocessing=True,
+    use_max_autotune=True,
     **kwargs,
 ):
     hydra_overrides_extra = list(hydra_overrides_extra or [])
+    hydra_overrides_extra.append(
+        f"++model.use_max_autotune={str(bool(use_max_autotune)).lower()}"
+    )
 
     if apply_postprocessing:
         hydra_overrides_extra += [
@@ -109,6 +113,7 @@ def build_efficienttam_video_predictor(
     execution_mode="sequential",
     fixed_num_views=2,
     max_objects_per_view=4,
+    use_max_autotune=True,
     **kwargs,
 ):
     hydra_overrides_extra = list(hydra_overrides_extra or [])
@@ -131,6 +136,7 @@ def build_efficienttam_video_predictor(
         f"++model.execution_mode={execution_mode}",
         f"++model.fixed_num_views={int(fixed_num_views)}",
         f"++model.max_objects_per_view={int(max_objects_per_view)}",
+        f"++model.use_max_autotune={str(bool(use_max_autotune)).lower()}",
     ]
     if vos_optimized:
         hydra_overrides = [
@@ -139,6 +145,7 @@ def build_efficienttam_video_predictor(
             f"++model.execution_mode={execution_mode}",
             f"++model.fixed_num_views={int(fixed_num_views)}",
             f"++model.max_objects_per_view={int(max_objects_per_view)}",
+            f"++model.use_max_autotune={str(bool(use_max_autotune)).lower()}",
         ]
 
     if apply_postprocessing:

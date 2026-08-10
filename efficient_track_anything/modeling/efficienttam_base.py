@@ -100,8 +100,17 @@ class EfficientTAMBase(torch.nn.Module):
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
         sam_mask_decoder_extra_args=None,
         compile_image_encoder: bool = False,
+        use_max_autotune: bool = True,
     ):
         super().__init__()
+
+        # Global torch.compile optimization policy for this model.  Keep the
+        # choice on the base class so every compiled submodule uses one
+        # consistent mode unless it has a known stability exception.
+        self.use_max_autotune = bool(use_max_autotune)
+        self.compile_optimization_mode = (
+            "max-autotune" if self.use_max_autotune else "default"
+        )
 
         # select_algorithm.PRINT_AUTOTUNE = False
         # inductor_config.max_autotune_report_choices_stats = False
@@ -196,12 +205,13 @@ class EfficientTAMBase(torch.nn.Module):
         if compile_image_encoder:
             # Compile the forward function (not the full module) to allow loading checkpoints.
             print(
-                "Image encoder compilation is enabled. First forward pass will be slow."
+                "Image encoder compilation is enabled. First forward pass will be slow. "
+                f"Compile mode={self.compile_optimization_mode}."
             )
             
             self.image_encoder.forward = torch.compile(
                 self.image_encoder.forward,
-                mode="max-autotune",
+                mode=self.compile_optimization_mode,
                 fullgraph=True,
                 dynamic=False,
             )

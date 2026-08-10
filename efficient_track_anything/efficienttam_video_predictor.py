@@ -2465,14 +2465,18 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
 
 
 class EfficientTAMVideoPredictorVOS(EfficientTAMVideoPredictor):
-    """Optimized for the VOS setting"""
+    """Optimized for the VOS setting."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._compile_all_components()
 
     def _compile_all_components(self):
-        print("Compiling all components for VOS setting. First time may be very slow.")
+        compile_mode = self.compile_optimization_mode
+        print(
+            "Compiling all components for VOS setting. First time may be very slow. "
+            f"Compile mode={compile_mode}."
+        )
 
         # memory_attention is specialized with dynamic=False because the dynamic
         # B>1 path currently triggers a TorchInductor fusion/codegen failure. Its
@@ -2487,7 +2491,7 @@ class EfficientTAMVideoPredictorVOS(EfficientTAMVideoPredictor):
 
         self.memory_encoder.forward = torch.compile(
             self.memory_encoder.forward,
-            mode="max-autotune",
+            mode=compile_mode,
             fullgraph=True,
             dynamic=False,
         )
@@ -2501,14 +2505,14 @@ class EfficientTAMVideoPredictorVOS(EfficientTAMVideoPredictor):
 
         self.sam_prompt_encoder.forward = torch.compile(
             self.sam_prompt_encoder.forward,
-            mode="max-autotune",
+            mode=compile_mode,
             fullgraph=True,
             dynamic=False,  # Accuracy regression on True
         )
 
         self.sam_mask_decoder.forward = torch.compile(
             self.sam_mask_decoder.forward,
-            mode="max-autotune",
+            mode=compile_mode,
             fullgraph=True,
             dynamic=False,  # Accuracy regression on True
         )

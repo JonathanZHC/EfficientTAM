@@ -110,6 +110,7 @@ The VOS-optimized path keeps the stable settings established during the B>1 work
 - memory encoder: `max-autotune`, `dynamic=False`;
 - memory attention: `default`, `dynamic=False` (avoids the B>1 Inductor fusion bug);
 - prompt encoder and mask decoder: `max-autotune`, `dynamic=False`;
+- `use_max_autotune=False` switches the memory encoder, prompt encoder, and mask decoder to `mode="default"` for faster compile/startup experiments; `memory_attention` remains `default` in both cases.
 - Dynamo recompile limit is raised to at least 16 because temporal memory length grows
   through a finite set of static specializations during warmup;
 - invalid max-autotune candidates that exceed the GPU shared-memory limit are pruned
