@@ -76,6 +76,13 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
             raise ValueError("fixed_num_views must be > 0")
         if self.max_objects_per_view <= 0:
             raise ValueError("max_objects_per_view must be > 0")
+        # Active-slot propagation (fixed_batch only, opt-in): between two corrections only the slots marked
+        # active with set_fixed_batch_active_slots() are propagated, in a batch padded to the next size of
+        # fixed_batch_buckets() so compiled graphs are reused. Inactive slots return NO_OBJ_SCORE logits and keep
+        # their (stale) history until the next correction, which re-runs every slot and resets all histories.
+        self.fixed_batch_skip_inactive = False
+        self._no_obj_rows = {}
+        self._active_index_cache = {}
 
     @torch.inference_mode()
     def init_state(
@@ -1012,6 +1019,15 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
             raise ValueError("forward direct correction requires current_frame_idx > reference_frame_idx")
 
         if self.execution_mode == EXECUTION_MODE_FIXED_BATCH:
+            if self.fixed_batch_skip_inactive:
+                return self._correct_fixed_active_from_reference(
+                    inference_states,
+                    reference_feature_snapshot,
+                    reference_masks,
+                    current_frame_idx,
+                    current_feature_snapshot=current_feature_snapshot,
+                    reverse=reverse,
+                )
             return self._correct_fixed_multiview_from_reference(
                 inference_states,
                 reference_feature_snapshot,
@@ -1048,7 +1064,11 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
                 raise RuntimeError(
                     "Call prepare_multiview_states(...) before direct correction."
                 )
-        self._validate_fixed_batch_history_alignment(inference_states)
+        # Only the active slots must be aligned: inactive ones may be stale (skipping), and the correction below
+        # ignores every history anyway (it attends to the corrected reference only) and then resets all of them.
+        active_slots = self._fixed_batch_active_order(inference_states)
+        if active_slots:
+            self._validate_fixed_batch_history_alignment(inference_states, slots=active_slots)
         reference_frame_idx = int(reference_feature_snapshot["frame_idx"])
 
         reference_masks_per_view = []
@@ -1470,6 +1490,13 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
     ):
         """Propagate one synchronized multi-view frame using the configured mode."""
         if self.execution_mode == EXECUTION_MODE_FIXED_BATCH:
+            if self.fixed_batch_skip_inactive:
+                return self._propagate_fixed_active_step(
+                    inference_states=inference_states,
+                    frame_idx=frame_idx,
+                    reverse=reverse,
+                    image_feature_snapshot=image_feature_snapshot,
+                )
             return self.propagate_fixed_multiview_step(
                 inference_states=inference_states,
                 frame_idx=frame_idx,
@@ -1653,7 +1680,7 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
         self._validate_fixed_batch_history_alignment(inference_states)
         return inference_states
 
-    def _validate_fixed_batch_history_alignment(self, inference_states):
+    def _validate_fixed_batch_history_alignment(self, inference_states, slots=None):
         """
         Require identical conditioning/non-conditioning frame keys for all slots.
 
@@ -1662,7 +1689,8 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
         topology aligned gives exact semantics without introducing approximate
         memory padding for newly-created objects.
         """
-        slots = self._fixed_batch_slot_order(inference_states)
+        all_slots = self._fixed_batch_slot_order(inference_states)
+        slots = all_slots if slots is None else slots
         reference = None
         for view_idx, obj_idx in slots:
             out = inference_states[view_idx]["output_dict_per_obj"][obj_idx]
@@ -1721,10 +1749,13 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
             ]
         return packed
 
-    def _pack_fixed_batch_output_dict(self, inference_states):
-        """Pack all view/object histories into one output_dict with batch B=V*S."""
-        self._validate_fixed_batch_history_alignment(inference_states)
-        slots = self._fixed_batch_slot_order(inference_states)
+    def _pack_fixed_batch_output_dict(self, inference_states, slots=None):
+        """Pack the view/object histories of ``slots`` (default: all, B=V*S) into one output_dict."""
+        if slots is None:
+            self._validate_fixed_batch_history_alignment(inference_states)
+            slots = self._fixed_batch_slot_order(inference_states)
+        else:
+            self._validate_fixed_batch_history_alignment(inference_states, slots=sorted(set(slots)))
         packed = {
             "cond_frame_outputs": {},
             "non_cond_frame_outputs": {},
@@ -1954,6 +1985,294 @@ class EfficientTAMVideoPredictor(EfficientTAMBase):
             )
 
         return results
+
+    def fixed_batch_buckets(self):
+        """Batch sizes of active-slot propagation: powers of two below V*S, then V*S."""
+        total = self.fixed_num_views * self.max_objects_per_view
+        buckets, size = [], 1
+        while size < total:
+            buckets.append(size)
+            size *= 2
+        buckets.append(total)
+        return buckets
+
+    def set_fixed_batch_active_slots(self, inference_states, active_per_view):
+        """Mark the slots (per view: object indices) to propagate until the next call."""
+        if len(active_per_view) != len(inference_states):
+            raise ValueError("active_per_view needs one entry per view")
+        for state, active in zip(inference_states, active_per_view):
+            indices = sorted({int(i) for i in active})
+            if any(i < 0 or i >= self.max_objects_per_view for i in indices):
+                raise ValueError(f"active slot out of range: {indices}")
+            state["fixed_batch_active_slots"] = indices
+
+    def _fixed_batch_active_order(self, inference_states):
+        """View-major (view_idx, obj_idx) of the active slots (all slots when skipping is off)."""
+        slots = self._fixed_batch_slot_order(inference_states)
+        if not self.fixed_batch_skip_inactive:
+            return slots
+        return [
+            (view_idx, obj_idx)
+            for view_idx, state in enumerate(inference_states)
+            for obj_idx in state.get("fixed_batch_active_slots", range(self.max_objects_per_view))
+        ]
+
+    def _no_obj_row(self, like, height, width):
+        key = (like.dtype, like.device, height, width)
+        row = self._no_obj_rows.get(key)
+        if row is None:
+            row = torch.full((1, 1, height, width), NO_OBJ_SCORE, dtype=like.dtype, device=like.device)
+            self._no_obj_rows[key] = row
+        return row
+
+    def _active_row_index(self, active, view_idx, device):
+        """Rows of [active masks..., NO_OBJ row] that form view ``view_idx``'s S output masks (cached)."""
+        key = (tuple(active), view_idx, str(device))
+        index = self._active_index_cache.get(key)
+        if index is None:
+            position = {slot: i for i, slot in enumerate(active)}
+            rows = [position.get((view_idx, obj_idx), len(active)) for obj_idx in range(self.max_objects_per_view)]
+            index = torch.tensor(rows, dtype=torch.long, device=device)
+            if len(self._active_index_cache) > 256:
+                self._active_index_cache.clear()
+            self._active_index_cache[key] = index
+        return index
+
+    def _active_slot_features(self, inference_states, frame_idx, feature_snapshot, batch_views):
+        """Per-slot vision features [HW, B, C] for a batch whose slot b belongs to view batch_views[b]."""
+        if feature_snapshot is None:
+            self.cache_image_features_batched(inference_states, [frame_idx] * len(inference_states))
+        else:
+            self._install_multiview_feature_snapshot(
+                inference_states, feature_snapshot, expected_frame_idx=frame_idx
+            )
+        per_view = [
+            self._get_image_feature(state, frame_idx=frame_idx, batch_size=1)
+            for state in inference_states
+        ]
+        num_levels = len(per_view[0][2])
+        feats = [torch.cat([per_view[v][2][level] for v in batch_views], dim=1) for level in range(num_levels)]
+        pos = [torch.cat([per_view[v][3][level] for v in batch_views], dim=1) for level in range(num_levels)]
+        return feats, pos, per_view[0][4]
+
+    def _assemble_active_results(self, inference_states, frame_idx, active, video_res_active, extra=None):
+        """Per-view results with all S slots: active rows from video_res_active, others NO_OBJ_SCORE."""
+        state0 = inference_states[0]
+        height, width = state0["video_height"], state0["video_width"]
+        like = video_res_active if video_res_active is not None else torch.empty(0, device=state0["device"])
+        no_obj = self._no_obj_row(like, height, width)
+        rows = no_obj if video_res_active is None else torch.cat([video_res_active, no_obj], dim=0)
+        results = []
+        for view_idx, state in enumerate(inference_states):
+            real_count = int(state.get("fixed_batch_real_obj_count", self.max_objects_per_view))
+            index = self._active_row_index(active, view_idx, rows.device)[:real_count]
+            result = {
+                "view_idx": view_idx,
+                "frame_idx": frame_idx,
+                "obj_ids": list(state.get("fixed_batch_real_obj_ids", [])),
+                "video_res_masks": rows.index_select(0, index),
+                "num_real_objects": real_count,
+                "num_dummy_objects": self.max_objects_per_view - real_count,
+                "num_active_objects": sum(1 for v, o in active if v == view_idx and o < real_count),
+                "execution_mode": EXECUTION_MODE_FIXED_BATCH,
+            }
+            result.update(extra or {})
+            results.append(result)
+        return results
+
+    @torch.inference_mode()
+    def _correct_fixed_active_from_reference(
+        self,
+        inference_states,
+        reference_feature_snapshot,
+        reference_masks,
+        current_frame_idx,
+        current_feature_snapshot=None,
+        reverse=False,
+    ):
+        """_correct_fixed_multiview_from_reference restricted to the active slots (fixed_batch_skip_inactive).
+
+        The caller marks the slots of the NEW object set active before calling (set_fixed_batch_active_slots).
+        Only those are corrected (reference + current track_step, padded to a bucket); their histories become
+        the corrected reference + current frame. Inactive slots keep a stale history and return NO_OBJ_SCORE.
+        """
+        if self.non_overlap_masks_for_mem_enc:
+            raise RuntimeError("fixed-batch direct correction requires non_overlap_masks_for_mem_enc=False")
+        for state in inference_states:
+            if not state.get("fixed_batch_prepared", False):
+                raise RuntimeError("Call prepare_multiview_states(...) before direct correction.")
+        active = self._fixed_batch_active_order(inference_states)
+        reference_frame_idx = int(reference_feature_snapshot["frame_idx"])
+        if not active:
+            return self._assemble_active_results(inference_states, current_frame_idx, active, None)
+
+        # Only the active slots' masks are uploaded and resized (full-resolution masks: ~2 MB each as float).
+        for state, masks in zip(inference_states, reference_masks):
+            real_count = int(state.get("fixed_batch_real_obj_count", self.max_objects_per_view))
+            if len(masks) != real_count:
+                raise ValueError(
+                    f"reference mask count {len(masks)} does not match expected real object count {real_count}"
+                )
+        active_masks = self._normalize_reference_masks(
+            inference_states[0], [reference_masks[v][o] for v, o in active], len(active)
+        )
+        bucket = next(b for b in self.fixed_batch_buckets() if b >= len(active))
+        padded = active + [active[0]] * (bucket - len(active))
+        batch_views = [v for v, _ in padded]
+        reference_mask_batch = torch.cat([active_masks] + [active_masks[0:1]] * (bucket - len(active)), dim=0)
+
+        reference_feats, reference_pos, feat_sizes = self._active_slot_features(
+            inference_states, reference_frame_idx, reference_feature_snapshot, batch_views
+        )
+        current_feats, current_pos, current_sizes = self._active_slot_features(
+            inference_states, current_frame_idx, current_feature_snapshot, batch_views
+        )
+        if current_sizes != feat_sizes:
+            raise RuntimeError("reference and current feature sizes differ")
+
+        self._mark_cudagraph_step_begin()
+        reference_out = self.track_step(
+            frame_idx=reference_frame_idx,
+            is_init_cond_frame=True,
+            current_vision_feats=reference_feats,
+            current_vision_pos_embeds=reference_pos,
+            feat_sizes=feat_sizes,
+            point_inputs=None,
+            mask_inputs=reference_mask_batch,
+            output_dict={"cond_frame_outputs": {}, "non_cond_frame_outputs": {}},
+            num_frames=inference_states[0]["num_frames"],
+            track_in_reverse=reverse,
+            run_mem_encoder=True,
+            prev_sam_mask_logits=None,
+        )
+        reference_persistent = self._clone_compact_output_persistent(reference_out)
+        self._mark_cudagraph_step_begin()
+        current_out = self.track_step(
+            frame_idx=current_frame_idx,
+            is_init_cond_frame=False,
+            current_vision_feats=current_feats,
+            current_vision_pos_embeds=current_pos,
+            feat_sizes=feat_sizes,
+            point_inputs=None,
+            mask_inputs=None,
+            output_dict={"cond_frame_outputs": {reference_frame_idx: reference_persistent}, "non_cond_frame_outputs": {}},
+            num_frames=inference_states[0]["num_frames"],
+            track_in_reverse=reverse,
+            run_mem_encoder=True,
+            prev_sam_mask_logits=None,
+        )
+        pred_masks_gpu = current_out["pred_masks"][: len(active)]
+        if self.fill_hole_area > 0:
+            pred_masks_gpu = fill_holes_in_mask_scores(pred_masks_gpu, self.fill_hole_area)
+
+        for batch_idx, (view_idx, obj_idx) in enumerate(active):
+            state = inference_states[view_idx]
+            self._replace_state_history_from_correction(
+                state,
+                obj_idx,
+                reference_frame_idx,
+                reference_mask_batch[batch_idx : batch_idx + 1],
+                self._compact_batched_slot_output(state, reference_persistent, batch_idx),
+                current_frame_idx,
+                self._compact_batched_slot_output(state, current_out, batch_idx),
+                reverse,
+            )
+        self._validate_fixed_batch_history_alignment(inference_states, slots=active)
+        _, video_res_active = self._get_orig_video_res_output(inference_states[0], pred_masks_gpu)
+        return self._assemble_active_results(inference_states, current_frame_idx, active, video_res_active)
+
+    @torch.inference_mode()
+    def _propagate_fixed_active_step(
+        self,
+        inference_states,
+        frame_idx,
+        reverse=False,
+        image_feature_snapshot=None,
+    ):
+        """propagate_fixed_multiview_step restricted to the active slots (fixed_batch_skip_inactive).
+
+        The active slots form one batch, padded to the next fixed_batch_buckets() size by repeating the first
+        active slot (its duplicate outputs are discarded). Per active slot the computation is the one of the
+        full fixed batch (slots are independent batch elements); inactive slots get NO_OBJ_SCORE logits and no
+        history entry for this frame.
+        """
+        if self.non_overlap_masks_for_mem_enc:
+            raise RuntimeError("active-slot propagation requires non_overlap_masks_for_mem_enc=False")
+        for state in inference_states:
+            if not state.get("fixed_batch_prepared", False):
+                raise RuntimeError(
+                    "Call prepare_fixed_multiview_states(...) before fixed-batch propagation."
+                )
+        active = self._fixed_batch_active_order(inference_states)
+        if active:
+            self._validate_fixed_batch_history_alignment(inference_states, slots=active)
+        for view_idx, obj_idx in active:
+            obj_out = inference_states[view_idx]["output_dict_per_obj"][obj_idx]
+            if frame_idx in obj_out["cond_frame_outputs"]:
+                raise RuntimeError(
+                    f"Frame {frame_idx} is a conditioning frame for at least one slot."
+                )
+
+        video_res_active = None
+        if not active:
+            # Nothing to track; keep the snapshot installed like the full path does.
+            if image_feature_snapshot is not None:
+                self._install_multiview_feature_snapshot(
+                    inference_states, image_feature_snapshot, expected_frame_idx=frame_idx
+                )
+        else:
+            bucket = next(b for b in self.fixed_batch_buckets() if b >= len(active))
+            padded = active + [active[0]] * (bucket - len(active))
+            current_vision_feats, current_vision_pos_embeds, feat_sizes = self._active_slot_features(
+                inference_states, frame_idx, image_feature_snapshot, [v for v, _ in padded]
+            )
+            packed_output_dict = self._pack_fixed_batch_output_dict(inference_states, slots=padded)
+
+            self._mark_cudagraph_step_begin()
+            current_out = self.track_step(
+                frame_idx=frame_idx,
+                is_init_cond_frame=False,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                point_inputs=None,
+                mask_inputs=None,
+                output_dict=packed_output_dict,
+                num_frames=inference_states[0]["num_frames"],
+                track_in_reverse=reverse,
+                run_mem_encoder=True,
+                prev_sam_mask_logits=None,
+            )
+            pred_masks_gpu = current_out["pred_masks"][: len(active)]
+            if self.fill_hole_area > 0:
+                pred_masks_gpu = fill_holes_in_mask_scores(pred_masks_gpu, self.fill_hole_area)
+
+            # The memory positional encoding depends only on the feature size: one B=1 copy for all views.
+            shared_pos = {}
+            if current_out["maskmem_pos_enc"] is not None:
+                raw_pos = [x[0:1] for x in current_out["maskmem_pos_enc"]]
+                for view_idx in {v for v, _ in active}:
+                    shared_pos[view_idx] = self._get_maskmem_pos_enc(
+                        inference_states[view_idx], {"maskmem_pos_enc": raw_pos}
+                    )
+            maskmem_features = current_out["maskmem_features"]
+            for batch_idx, (view_idx, obj_idx) in enumerate(active):
+                state = inference_states[view_idx]
+                storage_device = state["storage_device"]
+                slot_mem = None
+                if maskmem_features is not None:
+                    slot_mem = maskmem_features[batch_idx : batch_idx + 1].to(torch.bfloat16)
+                    slot_mem = slot_mem.to(storage_device, non_blocking=True)
+                state["output_dict_per_obj"][obj_idx]["non_cond_frame_outputs"][frame_idx] = {
+                    "maskmem_features": slot_mem,
+                    "maskmem_pos_enc": shared_pos.get(view_idx),
+                    "pred_masks": pred_masks_gpu[batch_idx : batch_idx + 1].to(storage_device, non_blocking=True),
+                    "obj_ptr": current_out["obj_ptr"][batch_idx : batch_idx + 1],
+                    "object_score_logits": current_out["object_score_logits"][batch_idx : batch_idx + 1],
+                }
+                state["frames_tracked_per_obj"][obj_idx][frame_idx] = {"reverse": reverse}
+            _, video_res_active = self._get_orig_video_res_output(inference_states[0], pred_masks_gpu)
+        return self._assemble_active_results(inference_states, frame_idx, active, video_res_active)
 
     @torch.inference_mode()
     def propagate_fixed_multiview(
